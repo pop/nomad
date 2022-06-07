@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -27,6 +28,7 @@ type Encrypter struct {
 	keys         map[string]*structs.RootKey // map of key IDs to key material
 	ciphers      map[string]cipher.AEAD      // map of key IDs to ciphers
 	keystorePath string
+	activeKeyID  string
 }
 
 // NewEncrypter loads or creates a new local keystore and returns an
@@ -79,11 +81,17 @@ func encrypterFromKeystore(keystoreDirectory string) (*Encrypter, error) {
 		}
 
 		err = encrypter.AddKey(key)
+		if key.Meta.Active {
+			encrypter.activeKeyID = key.Meta.KeyID
+		}
 		if err != nil {
 			return fmt.Errorf("could not add key file %s to keystore: %v", path, err)
 		}
 		return nil
 	})
+	if encrypter.activeKeyID == "" {
+		// err = errors.New("no active key found in keystore")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -91,26 +99,71 @@ func encrypterFromKeystore(keystoreDirectory string) (*Encrypter, error) {
 	return encrypter, nil
 }
 
-// Encrypt takes the serialized map[string][]byte from
-// SecureVariable.UnencryptedData, generates an appropriately-sized nonce
-// for the algorithm, and encrypts the data with the ciper for the
-// CurrentRootKeyID. The buffer returned includes the nonce.
-func (e *Encrypter) Encrypt(unencryptedData []byte, keyID string) []byte {
+// Encrypt takes a byte slice, generates an appropriately-sized nonce
+// for the algorithm, and encrypts the data with the cipher for the
+// CurrentRootKeyID. The buffer and key ID are returned. The buffer includes
+// the nonce.
+func (e *Encrypter) Encrypt(unencryptedData []byte) ([]byte, string) {
 	e.lock.RLock()
 	defer e.lock.RUnlock()
+	return e.encryptWithKeyIDLocked(unencryptedData, e.activeKeyID), e.activeKeyID
+}
 
+// EncryptWithKeyID takes a byte slice and the ID of a key in the keychain. It
+// generates an appropriately-sized nonce for the algorithm and encrypts the
+// data with the cipher for the requested key. The buffer returned includes the
+// nonce.
+func (e *Encrypter) EncryptWithKeyID(unencryptedData []byte, keyID string) []byte {
+	e.lock.RLock()
+	defer e.lock.RUnlock()
+	return e.encryptWithKeyIDLocked(unencryptedData, keyID)
+}
+
+// EncryptWithKeyID takes a byte slice and the ID of a key in the keychain. It
+// generates an appropriately-sized nonce for the algorithm and encrypts the
+// data with the cipher for the requested key. The buffer returned includes the
+// nonce.
+func (e *Encrypter) encryptWithKeyIDLocked(unencryptedData []byte, keyID string) []byte {
 	// TODO: actually encrypt!
 	return unencryptedData
 }
 
-// Decrypt takes an encrypted buffer and then root key ID. It extracts
-// the nonce, decrypts the content, and returns the cleartext data.
-func (e *Encrypter) Decrypt(encryptedData []byte, keyID string) ([]byte, error) {
+// Decrypt takes an encrypted buffer. Starting with the active root key, it
+// will attempt to extract the nonce, decrypt the content, and returns the
+// cleartext data. It will continue until it succeeds or it has exhausted all of
+// the keys in the keyring
+func (e *Encrypter) Decrypt(unencryptedData []byte) ([]byte, error) {
 	e.lock.RLock()
 	defer e.lock.RUnlock()
+	var d []byte
+	var err error
+	for _, k := range e.keys {
+		d, err = e.decryptWithKeyLocked(unencryptedData, k)
+		if err == nil {
+			continue
+		}
+		return d, err
+	}
+	return nil, errors.New("unable to decrypt with any available key")
+}
 
+// Decrypt takes an encrypted buffer. Using the active root key, it extracts
+// the nonce, decrypts the content, and returns the cleartext data.
+func (e *Encrypter) DecryptWithKeyID(unencryptedData []byte, keyID string) ([]byte, error) {
+	e.lock.RLock()
+	defer e.lock.RUnlock()
+	return e.decryptWithKeyIDLocked(unencryptedData, e.activeKeyID)
+}
+
+func (e *Encrypter) decryptWithKeyIDLocked(ed []byte, keyID string) ([]byte, error) {
+	return e.decryptWithKeyLocked(ed, e.keys[keyID])
+}
+
+// Decrypt takes an encrypted buffer and a key ID in the keychain. It extracts
+// the nonce, decrypts the content, and returns the cleartext data.
+func (e *Encrypter) decryptWithKeyLocked(ed []byte, k *structs.RootKey) ([]byte, error) {
 	// TODO: actually decrypt!
-	return encryptedData, nil
+	return ed, nil
 }
 
 // AddKey stores the key in the keystore and creates a new cipher for it.
@@ -229,4 +282,10 @@ func (e *Encrypter) loadKeyFromStore(path string) (*structs.RootKey, error) {
 		Key:  key,
 	}, nil
 
+}
+
+func (e *Encrypter) ActiveKeyID() string {
+	e.lock.RLock()
+	defer e.lock.RUnlock()
+	return e.activeKeyID
 }
